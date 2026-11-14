@@ -357,3 +357,14 @@ def calc_historical_volatility(
     annual_vol = daily_std * np.sqrt(periods_per_year)
 
     return round(annual_vol * 100, 2)
+
+
+def is_new_listing(bond: dict, today: str) -> bool:
+    """是否上市首日（单一规则出处，采集层与实时层共用）。
+
+    新浪/东财对上市首日的转债把「昨收」填成面值 100，于是 changepercent
+    会变成 (现价-100)/100 的假涨幅（实测 2026-11-13：123291 上市价 132 被算成 +32%）。
+    首日没有可比昨收，涨跌幅一律归零，与看板显示「-」的口径一致。
+    """
+    ld = (bond.get("list_date", "") or "")[:10]
+    return bool(ld and ld >= today)

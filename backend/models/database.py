@@ -3,9 +3,10 @@
 参考 arbTest/arbcore/database/db_manager.py 的设计模式
 """
 import os
+import json
 from datetime import datetime
-from typing import List, Optional
-from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, event
+from typing import List, Optional, Dict
+from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, Text, event, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from contextlib import contextmanager
 
@@ -93,6 +94,24 @@ class CBRecord(Base):
     created_at = Column(DateTime, default=datetime.now)
 
 
+class CBProfile(Base):
+    """当前债券档案（DB 唯一权威）。
+
+    与 cb_daily_snapshot 的分工：
+      - cb_daily_snapshot：历史收盘存档，一天一条，供回看/对账，只增不覆盖语义
+      - cb_bond_profile  ：当前工作集，保存「完整 bond dict + 东财条款」，
+                           盘中实时层以它为基准叠加实时行情。
+    存完整 payload 而非 ORM 列，是为了不丢失 maturity_redeem_price / terms 等
+    重算 YTM 必需的中间量（这些字段原本写库时会被丢弃）。
+    """
+    __tablename__ = "cb_bond_profile"
+
+    bond_code = Column(String(10), primary_key=True)
+    data_date = Column(String(10), nullable=False, index=True)
+    payload = Column(Text, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
 class DataStatusRecord(Base):
     """数据采集状态表"""
     __tablename__ = "data_status"
@@ -102,6 +121,21 @@ class DataStatusRecord(Base):
     source = Column(String(20), default="")
     total_count = Column(Integer, default=0)
     updated_at = Column(DateTime, default=datetime.now)
+
+
+class CBTerms(Base):
+    """东方财富条款缓存（低频静态数据）。
+
+    与 cb_bond_profile 的分工：档案只存「当前活跃债」的完整工作集；
+    本表存「全市场历史债」的条款（含已退市债），采集时用于过滤退市/到期、
+    补全到期日与票息。条款几乎不变，只有新债上市才需要新增，因此本地常驻，
+    不再每天全量翻东财 11 页（跨洋 30~45s 且末页常超时）。
+    """
+    __tablename__ = "cb_bond_terms"
+
+    bond_code = Column(String(10), primary_key=True)
+    payload = Column(Text, nullable=False)
+    fetched_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
 
 def init_database():
@@ -159,6 +193,84 @@ class CBDatabaseManager:
     def get_status(self) -> Optional[DataStatusRecord]:
         with get_db() as db:
             return db.query(DataStatusRecord).order_by(DataStatusRecord.data_date.desc()).first()
+
+    # ---- 当前档案（实时层的静态基准）----
+
+    def save_profile(self, data_date: str, bonds: List[dict], terms_map: Dict[str, dict]):
+        """整表替换当前档案。与 save_daily_snapshot 在同一次采集里写入，同源、无第二事实源。"""
+        with get_db() as db:
+            db.query(CBProfile).delete()
+            for b in bonds:
+                payload = dict(b)
+                payload["_terms"] = terms_map.get(b.get("bond_code", ""), {}) or {}
+                db.add(CBProfile(
+                    bond_code=b.get("bond_code", ""),
+                    data_date=data_date,
+                    payload=json.dumps(payload, ensure_ascii=False, default=str),
+                ))
+            db.commit()
+            print(f"[DB] 保存 {data_date} 档案: {len(bonds)} 条")
+
+    def get_profile(self) -> List[dict]:
+        """读取当前档案为 list[dict]（含 _terms）。"""
+        with get_db() as db:
+            rows = db.query(CBProfile).all()
+        out = []
+        for r in rows:
+            try:
+                out.append(json.loads(r.payload))
+            except (ValueError, TypeError):
+                continue
+        return out
+
+    def get_profile_date(self) -> str:
+        with get_db() as db:
+            row = db.query(CBProfile.data_date).first()
+            return row[0] if row else ""
+
+    # ---- 东财条款缓存（2026-11-14 增量采集）----
+
+    def get_terms(self) -> Dict[str, dict]:
+        """读取全部缓存条款；空表返回 {}（首次采集会走全量）。"""
+        with get_db() as db:
+            rows = db.query(CBTerms).all()
+        out = {}
+        for r in rows:
+            try:
+                out[r.bond_code] = json.loads(r.payload)
+            except (ValueError, TypeError):
+                continue
+        return out
+
+    def save_terms(self, terms: Dict[str, dict]) -> int:
+        """upsert 传入的条款；只覆盖传入代码，绝不删其他历史条目。
+
+        全量重建时调用方传入完整 terms ⇒ 所有 fetched_at 刷新为今天；
+        增量时只传新增代码 ⇒ 老条目年龄继续增长，到期触发下一次全量重建。
+        """
+        if not terms:
+            return 0
+        now = datetime.now()
+        rows = [
+            {"c": code, "p": json.dumps(t, ensure_ascii=False, default=str), "f": now}
+            for code, t in terms.items()
+        ]
+        with get_db() as db:
+            db.execute(
+                text("INSERT OR REPLACE INTO cb_bond_terms "
+                     "(bond_code, payload, fetched_at) VALUES (:c, :p, :f)"),
+                rows,
+            )
+            db.commit()
+        return len(rows)
+
+    def terms_refresh_age_days(self) -> Optional[float]:
+        """缓存里最老一条的年龄（天）；空表返回 None。用于决定是否全量重建。"""
+        with get_db() as db:
+            row = db.query(CBTerms.fetched_at).order_by(CBTerms.fetched_at.asc()).first()
+        if not row or not row[0]:
+            return None
+        return (datetime.now() - row[0]).total_seconds() / 86400.0
 
 
 db_manager = CBDatabaseManager()

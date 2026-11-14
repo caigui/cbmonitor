@@ -51,8 +51,17 @@ class StrategyResultVO(BaseModel):
 
 
 class DataStatusVO(BaseModel):
-    """数据状态"""
+    """数据状态：静态档案 + 实时行情分开报，避免把两种口径混成一个日期"""
     data_date: str = ""
     source: str = ""
     total_count: int = 0
     updated_at: str = ""
+    # ---- 实时层 ----
+    profile_date: str = ""
+    quote_date: str = ""
+    quote_time: str = ""
+    is_trading: bool = False
+    stale: bool = True
+    error: str = ""
+    refresh_seconds: int = 30
+    version: int = 0

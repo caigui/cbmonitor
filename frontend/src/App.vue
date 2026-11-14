@@ -18,11 +18,13 @@
       </div>
       <div class="top-right">
         <span class="status-info" v-if="status">
-          {{ status.data_date }} | {{ status.total_count }}只 | {{ status.source }}
+          档案 {{ status.profile_date || status.data_date }} | {{ status.total_count }}只
         </span>
-        <button class="refresh-btn" @click="handleRefresh" :disabled="loading">
-          {{ loading ? '采集中(约30秒)…' : '手动刷新' }}
-        </button>
+        <span :class="['quote-info', status.is_trading ? 'live' : 'closed', { stale: status.stale }]" v-if="status">
+          {{ status.is_trading ? '● 实时' : '○ 收盘' }}
+          {{ status.quote_time || (status.is_trading ? '--:--:--' : '收盘价') }}
+          <template v-if="status.stale"> · 延迟</template>
+        </span>
       </div>
     </header>
 
@@ -62,7 +64,8 @@
         <button class="filter-reset" @click="resetFilters">清除</button>
       </div>
       <div class="table-area">
-        <CBTable :bonds="filteredBonds" :loading="loading" />
+        <div v-if="loadError && bonds.length === 0" class="load-error">{{ loadError }}</div>
+        <CBTable v-else :bonds="filteredBonds" :loading="loading" />
       </div>
     </main>
 
@@ -105,9 +108,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 import CBTable from './components/CBTable.vue'
-import { getBonds, getStrategy, getStatus, collectData, type BondVO, type StrategyResultVO, type DataStatusVO } from './api'
+import { getBonds, getStrategy, getStatus, type BondVO, type StrategyResultVO, type DataStatusVO } from './api'
 
 const tabs = [
   { key: 'all', label: '全部转债' },
@@ -134,8 +137,11 @@ const activeStrategy = ref('double_low')
 const bonds = ref<BondVO[]>([])
 const strategyResult = ref<StrategyResultVO | null>(null)
 const status = ref<DataStatusVO | null>(null)
+const loadError = ref('')
 const loading = ref(false)
 const strategyLoading = ref(false)
+let retryTimer: number | undefined
+let retryCount = 0
 const searchText = ref('')
 
 // 筛选条件
@@ -192,12 +198,25 @@ const filteredBonds = computed(() => {
 })
 
 async function loadBonds() {
+  if (loading.value) return
   loading.value = true
   try {
     const res = await getBonds()
-    bonds.value = res.data
+    // 防御：非数组响应不当成成功，避免表格永远空白
+    bonds.value = Array.isArray(res.data) ? res.data : []
+    loadError.value = ''
+    retryCount = 0
   } catch (e) {
     console.error('加载失败', e)
+    retryCount += 1
+    if (retryCount <= 3) {
+      const wait = retryCount * 5
+      loadError.value = `数据加载失败，${wait} 秒后自动重试（${retryCount}/3）`
+      if (retryTimer) clearTimeout(retryTimer)
+      retryTimer = window.setTimeout(loadBonds, wait * 1000)
+    } else {
+      loadError.value = '数据加载失败，请检查网络后刷新页面'
+    }
   } finally {
     loading.value = false
   }
@@ -223,22 +242,40 @@ async function loadStatus() {
   } catch {}
 }
 
-async function handleRefresh() {
-  loading.value = true
+// 盘中实时：每 30s 只打轻量的 /status，version 变化才重拉全量 /bonds。
+// 外网抓取由服务端单一后台任务承担，这里无论多少用户、刷多少次都不产生额外外网请求。
+let pollTimer: number | undefined
+
+async function pollRealtime() {
+  if (document.visibilityState === 'hidden') return
   try {
-    await collectData('auto')
-    await loadBonds()
-    await loadStatus()
-  } catch (e) {
-    alert('采集失败: ' + e)
-  } finally {
-    loading.value = false
-  }
+    const prevVersion = status.value?.version ?? -1
+    const res = await getStatus()
+    status.value = res.data
+    // 正常靠 version 变化触发；额外兜底：bonds 为空说明首屏加载失败过，无条件重拉，
+    // 否则一次跨洋抖动会让看板永久停在「暂无数据」（2026-11-13 线上事故）。
+    if (!loading.value && (res.data.version !== prevVersion || bonds.value.length === 0)) {
+      await loadBonds()
+      if (activeTab.value !== 'all') await loadStrategy(activeStrategy.value)
+    }
+  } catch {}
+}
+
+function onVisible() {
+  if (document.visibilityState === 'visible') pollRealtime()
 }
 
 onMounted(() => {
   loadBonds()
   loadStatus()
+  pollTimer = window.setInterval(pollRealtime, 30000)
+  document.addEventListener('visibilitychange', onVisible)
+})
+
+onUnmounted(() => {
+  if (pollTimer) clearInterval(pollTimer)
+  if (retryTimer) clearTimeout(retryTimer)
+  document.removeEventListener('visibilitychange', onVisible)
 })
 </script>
 
@@ -272,13 +309,16 @@ html, body { height: 100%; overflow: hidden; }
 .tab-btn:hover { background: #f0f5ff; border-color: #c0d8f0; }
 .tab-btn.active { background: #4a90d9; color: #fff; border-color: #4a90d9; }
 .top-right { display: flex; align-items: center; gap: 12px; }
-.status-info { font-size: 12px; color: #95a5a6; }
-.refresh-btn {
-  padding: 6px 14px; background: #52c41a; color: #fff;
-  border: none; border-radius: 6px; cursor: pointer; font-size: 13px;
+.status-info { font-size: 12px; color: #95a5a6; white-space: nowrap; }
+.quote-info { font-size: 12px; white-space: nowrap; }
+.quote-info.live { color: #52c41a; }
+.quote-info.closed { color: #95a5a6; }
+.quote-info.stale { color: #e6a23c; }
+.load-error {
+  margin: 24px auto; max-width: 420px; padding: 16px 20px;
+  background: #fdf6ec; border: 1px solid #faecd8; border-radius: 6px;
+  font-size: 13px; color: #e6a23c; text-align: center; line-height: 1.6;
 }
-.refresh-btn:hover { background: #46b014; }
-.refresh-btn:disabled { background: #ccc; cursor: not-allowed; }
 
 .main-content {
   background: #fff; border-radius: 6px; padding: 6px;
@@ -343,13 +383,13 @@ html, body { height: 100%; overflow: hidden; }
     row-gap: 6px;
     padding: 7px 10px;
   }
-  /* 第一行：标题 + 刷新按钮 */
+  /* 第一行：标题 + 档案/行情双状态 */
   .top-left { flex: 0 1 auto; min-width: 0; }
   .title { font-size: 16px; }
   .subtitle { display: none; }        /* 省空间，"CBMonitor" 已足够表意 */
-  .top-right { flex: 0 0 auto; margin-left: auto; gap: 8px; }
+  .top-right { flex: 0 0 auto; margin-left: auto; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
   .status-info { font-size: 11px; }
-  .refresh-btn { padding: 5px 11px; font-size: 12.5px; white-space: nowrap; }
+  .quote-info { font-size: 11px; }
   /* 第二行：3 个 Tab 等宽铺满 */
   .top-center { flex: 1 1 100%; order: 3; gap: 5px; }
   .tab-btn { flex: 1 1 0; padding: 6px 4px; font-size: 13px; white-space: nowrap; }
@@ -364,7 +404,7 @@ html, body { height: 100%; overflow: hidden; }
 @media (max-width: 360px) {
   .title { font-size: 15px; }
   .status-info { font-size: 10px; }
-  .refresh-btn { padding: 4px 8px; font-size: 11.5px; }
+  .quote-info { font-size: 10px; }
   .tab-btn { font-size: 12px; }
 }
 </style>

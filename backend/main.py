@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.database import db_manager, init_database, CBRecord
 from models.schemas import BondVO, StrategyResultVO, DataStatusVO
-from services.data_collector import collector
+from services.realtime_service import realtime
 from services.strategy_engine import run_strategy, ALL_STRATEGIES
 
 # 日志配置
@@ -82,46 +82,77 @@ def _record_to_vo(record: CBRecord) -> BondVO:
     )
 
 
+def _current_bonds() -> List[BondVO]:
+    """主看板数据：静态档案 + 盘中实时行情（内存），档案未就绪时回退 DB 最新快照。"""
+    merged = realtime.get_bonds()
+    if merged:
+        # Pydantic 默认忽略多余字段（list_date / maturity_redeem_price / _terms 等）
+        return [BondVO(**b) for b in merged]
+    return [_record_to_vo(r) for r in db_manager.get_latest_bonds()]
+
+
+# ========== 生命周期 ==========
+
+@app.on_event("startup")
+async def on_startup():
+    init_database()
+    await realtime.start()
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await realtime.stop()
+
+
 # ========== API 路由 ==========
 
 @app.get("/")
 async def root():
-    return {"message": "CBMonitor API 运行中", "version": "1.0.0"}
+    return {"message": "CBMonitor API 运行中", "version": "2.0.0"}
 
 
 @app.get("/api/status", response_model=DataStatusVO)
 async def get_status():
-    """获取数据采集状态"""
-    status = db_manager.get_status()
-    if not status:
-        return DataStatusVO()
+    """静态档案状态 + 实时行情状态，两个时间戳分开报"""
+    st = db_manager.get_status()
+    s = realtime.get_state()
     return DataStatusVO(
-        data_date=status.data_date or "",
-        source=status.source or "",
-        total_count=status.total_count or 0,
-        updated_at=status.updated_at.strftime("%Y-%m-%d %H:%M:%S") if status.updated_at else ""
+        data_date=st.data_date if st else "",
+        source=st.source if st else "",
+        total_count=s["total_count"] or (st.total_count if st else 0),
+        updated_at=st.updated_at.strftime("%Y-%m-%d %H:%M:%S") if st and st.updated_at else "",
+        profile_date=s["profile_date"],
+        quote_date=s["quote_date"],
+        quote_time=s["quote_time"],
+        is_trading=s["is_trading"],
+        stale=s["stale"],
+        error=s["error"],
+        refresh_seconds=s["refresh_seconds"],
+        version=s["version"],
     )
+
+
+@app.get("/api/realtime")
+async def get_realtime():
+    """轻量探针：前端每 30s 打这个，version 变化才重拉 /api/bonds（省跨洋回源）"""
+    return realtime.get_state()
 
 
 @app.get("/api/bonds", response_model=List[BondVO])
 async def get_bonds(
-    date: str = Query("", description="数据日期，空=最新"),
+    date: str = Query("", description="数据日期，空=最新实时"),
     sort_by: str = Query("double_low", description="排序字段"),
     sort_order: str = Query("asc", description="排序方向 asc/desc"),
 ):
-    """获取可转债列表"""
+    """获取可转债列表；带 date 时读历史收盘快照，否则读盘中实时数据"""
     if date:
-        records = db_manager.get_snapshot_by_date(date)
+        bonds = [_record_to_vo(r) for r in db_manager.get_snapshot_by_date(date)]
     else:
-        records = db_manager.get_latest_bonds()
+        bonds = _current_bonds()
 
-    bonds = [_record_to_vo(r) for r in records]
-
-    # 排序
     reverse = sort_order == "desc"
     if sort_by and hasattr(bonds[0] if bonds else None, sort_by):
         bonds.sort(key=lambda x: getattr(x, sort_by, 0) or 0, reverse=reverse)
-
     return bonds
 
 
@@ -137,13 +168,14 @@ async def get_strategy(
 
     if date:
         records = db_manager.get_snapshot_by_date(date)
+        bonds = [_record_to_vo(r) for r in records]
     else:
-        records = db_manager.get_latest_bonds()
+        # 与主看板同一份实时数据，避免「主看板实时 / 策略集静止」的口径分裂
+        bonds = _current_bonds()
 
-    if not records:
+    if not bonds:
         raise HTTPException(status_code=404, detail="暂无数据，请先采集")
 
-    bonds = [_record_to_vo(r) for r in records]
     return run_strategy(strategy_key, bonds, n)
 
 
@@ -153,24 +185,10 @@ async def list_strategies():
     return list(ALL_STRATEGIES.keys())
 
 
-@app.post("/api/collect")
-async def collect_data(source: str = Query("auto", description="数据源（保留兼容，实际使用AKShare+东方财富）")):
-    """手动触发数据采集 - 基于 AKShare + 东方财富直连 + 自主计算引擎"""
-    try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        logger.info(f"[API] 开始采集数据, source={source}")
-        raw_bonds = collector.collect(source)
-        db_manager.save_daily_snapshot(today, raw_bonds, source)
-        return {
-            "success": True,
-            "message": f"采集完成: {len(raw_bonds)} 条",
-            "date": today,
-            "source": source,
-            "count": len(raw_bonds)
-        }
-    except Exception as e:
-        logger.error(f"[API] 采集失败: {e}")
-        raise HTTPException(status_code=500, detail=f"采集失败: {str(e)}")
+# ⚠️ POST /api/collect 已移除（2026-11-13）。
+#   原因：原实现在 async def 里同步跑 30~45s 采集，会阻塞 uvicorn 事件循环；
+#   采集改由独立脚本 collect_once.py + systemd timer 承担，服务只读。
+#   nginx 的 `location = /cb_api/collect { return 403; }` 保留作纵深防御。
 
 
 # ========== 启动 ==========

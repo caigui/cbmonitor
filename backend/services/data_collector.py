@@ -63,53 +63,125 @@ class EastMoneyDataCenter:
         self.session.proxies = SESSION_PROXIES
         self.session.trust_env = False
 
+    # 2026-11-14：pageSize 100→500，页数 11→3，实测每页 3.6s、末页不再 30s 超时。
+    # 配合 cb_bond_terms 本地缓存后，日常采集根本不走这个全量分支。
+    PAGE_SIZE = 500
+    MAX_INCREMENTAL = 60     # 缺失过多说明缓存失效，退回全量，避免发几十个单代码请求
+
     def fetch_bond_terms(self) -> Dict[str, Dict]:
-        result = {}
+        """全量拉取（缓存为空 / 到期重建时用）。失败页重试一次，条款不全由质量闸门兜底。"""
+        result: Dict[str, Dict] = {}
         page = 1
-        while True:
+        failed = []
+        while page <= 10:
             params = {
                 "reportName": "RPT_BOND_CB_LIST",
                 "columns": "ALL",
-                "pageSize": "100",
+                "pageSize": str(self.PAGE_SIZE),
                 "pageNumber": str(page),
                 "sortColumns": "SECURITY_CODE",
                 "sortTypes": "1",
                 "source": "WEB",
                 "client": "WEB",
             }
-            try:
-                resp = self.session.get(self.BASE_URL, params=params, timeout=30)
-                resp.raise_for_status()
-                data = resp.json()
-                rows = data.get("result", {}).get("data", []) if data.get("result") else []
-                if not rows:
+            rows = []
+            for attempt in (1, 2):
+                try:
+                    resp = self.session.get(self.BASE_URL, params=params, timeout=20)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    rows = data.get("result", {}).get("data", []) if data.get("result") else []
                     break
-                for item in rows:
-                    code = str(item.get("SECURITY_CODE", ""))
-                    if not code:
-                        continue
-                    exec_price_sh = self._safe_float(item.get("EXECUTE_PRICE_SH"))
-                    exec_price_hs = self._safe_float(item.get("EXECUTE_PRICE_HS"))
-                    maturity_redeem = exec_price_sh if exec_price_sh > 0 else exec_price_hs
-                    result[code] = {
-                        "maturity_date": str(item.get("EXPIRE_DATE", "") or ""),
-                        "delist_date": str(item.get("DELIST_DATE", "") or ""),
-                        "interest_rate_explain": str(item.get("INTEREST_RATE_EXPLAIN", "") or ""),
-                        "issue_size": self._safe_float(item.get("ACTUAL_ISSUE_SCALE")),
-                        "rating": str(item.get("RATING", "") or ""),
-                        "maturity_redeem_price": maturity_redeem,
-                        "value_date": str(item.get("VALUE_DATE", "") or ""),
-                        "bond_expire": self._safe_float(item.get("BOND_EXPIRE")),
-                        "par_value": self._safe_float(item.get("PAR_VALUE"), 100.0),
-                    }
-                if len(rows) < 100:
-                    break
-                page += 1
-            except Exception as e:
-                logger.warning(f"[EM_DataCenter] 获取条款失败 (page {page}): {e}")
+                except Exception as e:
+                    if attempt == 2:
+                        logger.warning("[EM_DataCenter] 全量 page %d 最终失败: %s", page, e)
+                        failed.append(page)
+                    else:
+                        logger.warning("[EM_DataCenter] 全量 page %d 重试一次: %s", page, e)
+            if not rows:
                 break
-        logger.info(f"[EM_DataCenter] 获取到 {len(result)} 条条款信息")
+            for item in rows:
+                code, term = self._parse_term_row(item)
+                if code:
+                    result[code] = term
+            if len(rows) < self.PAGE_SIZE:
+                break
+            page += 1
+        logger.info("[EM_DataCenter] 全量条款 %d 条 / 失败页 %s", len(result), failed or "无")
         return result
+
+    def fetch_single(self, code: str) -> Optional[Dict]:
+        """按单代码精准查条款（实测 1.33s）。
+
+        ⚠️ 多代码 `SECURITY_CODE in (...)` 语法实测会 30s 超时，只能逐个查；
+        配合缓存后每天通常只有 0~3 个新债需要查，代价可忽略。
+        """
+        params = {
+            "reportName": "RPT_BOND_CB_LIST",
+            "columns": "ALL",
+            "pageSize": "10",
+            "pageNumber": "1",
+            "source": "WEB",
+            "client": "WEB",
+            "filter": '(SECURITY_CODE="%s")' % code,
+        }
+        try:
+            resp = self.session.get(self.BASE_URL, params=params, timeout=12)
+            resp.raise_for_status()
+            data = resp.json()
+            rows = data.get("result", {}).get("data", []) if data.get("result") else []
+            for item in rows:
+                c, term = self._parse_term_row(item)
+                if c == code:
+                    return term
+        except Exception as e:
+            logger.warning("[EM_DataCenter] 单代码 %s 查询失败: %s", code, e)
+        return None
+
+    def fetch_bond_terms_incremental(self, cached: Dict[str, Dict], codes: set):
+        """缓存起手，只拉「一览表有、缓存没有」的新债条款。
+
+        返回 (merged, added, failed, need_full)。need_full=True 表示缓存明显失效，
+        调用方应改走 fetch_bond_terms() 全量重建。
+        """
+        merged = dict(cached or {})
+        missing = sorted({str(c) for c in codes} - set(merged.keys()))
+        if len(missing) > self.MAX_INCREMENTAL:
+            logger.warning("[EM_DataCenter] 缺失 %d 条 > %d，判定缓存失效，退回全量",
+                           len(missing), self.MAX_INCREMENTAL)
+            return {}, {}, [], True
+        added: Dict[str, Dict] = {}
+        failed = []
+        for code in missing:
+            term = self.fetch_single(code)
+            if term:
+                added[code] = term
+                merged[code] = term
+            else:
+                failed.append(code)
+        logger.info("[EM_DataCenter] 条款增量：缓存 %d 条 + 新增 %d 条，失败 %d 条",
+                    len(cached or {}), len(added), len(failed))
+        return merged, added, failed, False
+
+    @classmethod
+    def _parse_term_row(cls, item) -> tuple:
+        """全量分页与单代码查询共用的行解析，保证两种路径字段口径完全一致。"""
+        code = str(item.get("SECURITY_CODE", "") or "")
+        if not code:
+            return None, None
+        exec_price_sh = cls._safe_float(item.get("EXECUTE_PRICE_SH"))
+        exec_price_hs = cls._safe_float(item.get("EXECUTE_PRICE_HS"))
+        return code, {
+            "maturity_date": str(item.get("EXPIRE_DATE", "") or ""),
+            "delist_date": str(item.get("DELIST_DATE", "") or ""),
+            "interest_rate_explain": str(item.get("INTEREST_RATE_EXPLAIN", "") or ""),
+            "issue_size": cls._safe_float(item.get("ACTUAL_ISSUE_SCALE")),
+            "rating": str(item.get("RATING", "") or ""),
+            "maturity_redeem_price": exec_price_sh if exec_price_sh > 0 else exec_price_hs,
+            "value_date": str(item.get("VALUE_DATE", "") or ""),
+            "bond_expire": cls._safe_float(item.get("BOND_EXPIRE")),
+            "par_value": cls._safe_float(item.get("PAR_VALUE"), 100.0),
+        }
 
     @staticmethod
     def _safe_float(v, default=0.0):
@@ -151,8 +223,14 @@ class AKShareCollector:
 
     def __init__(self):
         self.em_api = EastMoneyDataCenter()
+        # 保留最后一次采集拿到的条款，供静态档案写库与盘中实时层重算 YTM 使用
+        self.last_bond_terms: Dict[str, Dict] = {}
+        # 本次新增/全量刷新的条款，供 collect_once.py 写回 cb_bond_terms 缓存
+        self.last_terms_added: Dict[str, Dict] = {}
+        self.terms_mode = ""
 
-    def fetch_cb_list(self) -> List[Dict]:
+    def fetch_cb_list(self, terms_cache: Optional[Dict[str, Dict]] = None,
+                      full_terms: bool = False) -> List[Dict]:
         logger.info("=" * 50)
         logger.info("[Collector] 开始采集可转债数据")
 
@@ -162,8 +240,29 @@ class AKShareCollector:
         # Step 2: 新浪实时行情（涨跌幅/成交额）
         df_spot = self._fetch_sina_spot()
 
-        # Step 3: 条款信息
-        bond_terms = self.em_api.fetch_bond_terms()
+        # Step 3: 条款 —— 本地缓存优先，只补新债；缓存为空/到期/失效则全量重建
+        codes = set()
+        if not df_basic.empty and "债券代码" in df_basic.columns:
+            codes = {str(c).strip() for c in df_basic["债券代码"]
+                     if re.match(r"^\d{6}$", str(c).strip())}
+        self.last_terms_added = {}
+        if terms_cache is not None and not full_terms:
+            bond_terms, added, failed, need_full = self.em_api.fetch_bond_terms_incremental(
+                terms_cache, codes)
+            self.terms_mode = "incremental"
+            if need_full:
+                bond_terms = self.em_api.fetch_bond_terms()
+                self.last_terms_added = dict(bond_terms)
+                self.terms_mode = "full(cache-invalid)"
+            else:
+                self.last_terms_added = added
+            logger.info("[Collector] 条款模式 %s / 单代码查询失败 %s",
+                        self.terms_mode, failed or "无")
+        else:
+            bond_terms = self.em_api.fetch_bond_terms()
+            self.last_terms_added = dict(bond_terms)
+            self.terms_mode = "full"
+        self.last_bond_terms = bond_terms
 
         # Step 4: 合并 + 自主计算
         bonds = self._merge_and_calculate(df_basic, df_spot, bond_terms)
@@ -589,6 +688,19 @@ class DataCollectorService:
 
     def collect(self, source: str = "auto") -> List[Dict]:
         return self.collector.fetch_cb_list()
+
+    def collect_with_terms(self, source: str = "auto",
+                           terms_cache: Optional[Dict[str, Dict]] = None,
+                           full_terms: bool = False) -> tuple:
+        """采集并返回 (bonds, terms_map, terms_added)。
+
+        terms_map 含 interest_rate_explain / par_value / value_date 等静态要素，
+        写进档案后，盘中实时层才能用与盘后完全相同的算法重算 YTM。
+        terms_added 是本次新增/全量刷新的条款，由调用方写回 cb_bond_terms 缓存。
+        """
+        bonds = self.collector.fetch_cb_list(terms_cache=terms_cache, full_terms=full_terms)
+        return (bonds, dict(self.collector.last_bond_terms),
+                dict(self.collector.last_terms_added))
 
 
 collector = DataCollectorService()
