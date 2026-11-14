@@ -368,3 +368,26 @@ def is_new_listing(bond: dict, today: str) -> bool:
     """
     ld = (bond.get("list_date", "") or "")[:10]
     return bool(ld and ld >= today)
+
+
+# 债项评级中的投机级（A 及以下）。A+ 及以上不标，避免满屏告警。
+_LOW_RATING = {"A", "A-", "BBB+", "BBB", "BBB-", "BB", "B", "CCC", "CC", "C", "D"}
+
+
+def bond_risk_flag(stock_name: str, credit_rating: str) -> str:
+    """信用风险提示文案（唯一规则出处；由 main.py 在 VO 构造时统一调用）。
+
+    只依据系统确实有的两个静态字段，不引入任何新数据源：
+      1) 正股简称含 ST / *ST → 退市风险警示
+      2) 债项评级 A 及以下（A / A- / BBB 系 / CCC…）→ 高信用风险
+    ⚠️ 「评级展望负面」无可靠数据源（东财 RATING 只给等级、集思录匿名只返回 30 只），
+    按「宁缺毋假」不生成该标识，也不把「低评级」冒充「负面展望」。
+    返回空串 = 无提示。这是**标识**，不参与任何策略的筛选与排序。
+    """
+    tags = []
+    if "ST" in (stock_name or "").upper():
+        tags.append("正股ST/*ST")
+    rating = (credit_rating or "").strip().upper()
+    if rating in _LOW_RATING:
+        tags.append("低评级" + rating)
+    return " / ".join(tags)

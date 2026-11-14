@@ -26,7 +26,7 @@
           <th class="sortable" @click="toggleSort('pb_ratio')">P/B <span class="arrow">{{ sortArrow('pb_ratio') }}</span></th>
           <th class="sortable" @click="toggleSort('remaining_years')">剩余年限 <span class="arrow">{{ sortArrow('remaining_years') }}</span></th>
           <th>到期时间</th>
-          <th class="sortable" @click="toggleSort('remaining_size')">剩余规模 <span class="arrow">{{ sortArrow('remaining_size') }}</span></th>
+          <th class="sortable" @click="toggleSort('remaining_size')">发行规模 <span class="arrow">{{ sortArrow('remaining_size') }}</span></th>
           <th class="sortable" @click="toggleSort('turnover_rate')">换手率 <span class="arrow">{{ sortArrow('turnover_rate') }}</span></th>
           <th class="sortable" @click="toggleSort('turnover_amount')">成交额(万) <span class="arrow">{{ sortArrow('turnover_amount') }}</span></th>
           <th class="sortable" @click="toggleSort('redeem_trigger_price')">强赎触发价 <span class="arrow">{{ sortArrow('redeem_trigger_price') }}</span></th>
@@ -48,7 +48,7 @@
           <td class="num hl-cell">{{ fmtPct(b.premium_rate) }}</td>
           <td class="num">{{ fmt(b.double_low) }}</td>
           <td class="num">{{ fmt(b.pure_bond_value) }}</td>
-          <td>{{ b.credit_rating }}</td>
+          <td>{{ b.credit_rating }}<span v-if="b.risk_flag" class="risk-tag" :title="b.risk_flag">⚠</span></td>
           <td class="num hl-cell">{{ fmtPct(b.pre_tax_yield) }}</td>
           <td class="num hl-cell">{{ fmtPct(b.pre_tax_put_yield) }}</td>
           <td class="num">{{ fmt(b.put_value) }}</td>
@@ -132,6 +132,13 @@ function fmtDate(d: string | undefined): string {
 <style scoped>
 .table-wrapper { width: 100%; }
 .loading, .empty { text-align: center; padding: 40px; color: #999; }
+
+/* 信用风险徽标：正股 ST / 低评级。挂在评级列后，不新增列，避免 26 列再变宽。
+   用橙色而非红绿，避免与中国行情「红涨绿跌」语义混淆；hover 显示具体原因。 */
+.risk-tag {
+  display: inline-block; margin-left: 3px; color: #b45309;
+  font-size: 11px; cursor: help; vertical-align: middle;
+}
 
 .cb-table {
   width: 100%; border-collapse: collapse; font-size: 12px;

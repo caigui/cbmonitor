@@ -25,6 +25,8 @@ class BondVO(BaseModel):
     remaining_size: float = 0.0
     maturity_date: str = ""
     credit_rating: str = ""
+    # 信用风险提示（正股ST / 低评级），由 calc_engine.bond_risk_flag 统一生成；空串=无提示
+    risk_flag: str = ""
     pure_bond_value: float = 0.0
     put_value: float = 0.0
     elasticity: float = 0.0

@@ -28,6 +28,7 @@ export interface BondVO {
   remaining_size: number
   maturity_date: string
   credit_rating: string
+  risk_flag?: string
   pure_bond_value: number
   put_value: number
   elasticity: number

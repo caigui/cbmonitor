@@ -51,7 +51,9 @@ def strategy_double_low(bonds: List[BondVO], n: int = 10) -> StrategyResultVO:
 def strategy_low_premium(bonds: List[BondVO], n: int = 10) -> StrategyResultVO:
     """低溢价策略：溢价率升序取前N"""
     filtered = _filter_basic(bonds)
-    filtered.sort(key=lambda x: x.premium_rate if x.premium_rate > 0 else 9999)
+    # 负溢价（转债价格低于转股价值）是本策略的最优标的，必须按真实数值参与排序。
+    # 旧写法 `> 0 else 9999` 会把负溢价全部踢到队尾（2026-11-14 实测漏掉 113615/127110）。
+    filtered.sort(key=lambda x: x.premium_rate if x.premium_rate is not None else 9999)
     selected = filtered[:n]
     return StrategyResultVO(
         strategy_name="低溢价策略", strategy_key="low_premium",
@@ -73,15 +75,20 @@ def strategy_low_price(bonds: List[BondVO], n: int = 10) -> StrategyResultVO:
 
 
 def strategy_high_yield(bonds: List[BondVO], n: int = 10) -> StrategyResultVO:
-    """高收益率策略：税前收益率降序取前N"""
+    """高收益率策略：只保留正 YTM，降序取前N；不足N只就如实返回，不拿负收益凑数。
+
+    2026-11-14 之前会把负收益率债填进前10（实测前10里只有2只正收益）。
+    高收益率债往往伴随信用风险，评级列的 ⚠ 标识用于提示，不改变选债口径。
+    """
     filtered = _filter_basic(bonds)
     # 排除剩余年限 < 0.25年的（快到期的债收益率没意义）
-    filtered = [b for b in filtered if b.remaining_years >= 0.25]
+    filtered = [b for b in filtered if b.remaining_years >= 0.25 and b.pre_tax_yield > 0]
     filtered.sort(key=lambda x: x.pre_tax_yield, reverse=True)
     selected = filtered[:n]
     return StrategyResultVO(
         strategy_name="高收益率策略", strategy_key="high_yield",
-        bonds=selected, filter_desc=f"税前收益率最高{n}只，剔除评级<A-及到期，剩余年限≥0.25年",
+        bonds=selected,
+        filter_desc=f"正YTM共{len(filtered)}只，取最高{len(selected)}只；剔除评级<A-、到期、剩余年限<0.25年",
         data_date=bonds[0].data_date if bonds else ""
     )
 
@@ -96,7 +103,7 @@ def jgb_micro_cap(bonds: List[BondVO]) -> StrategyResultVO:
     return StrategyResultVO(
         strategy_name="检钢蹦-微盘转债", strategy_key="jgb_micro_cap",
         bonds=selected,
-        filter_desc="价格115-145，剩余规模<3亿，向下波动有限，弹性高",
+        filter_desc="价格115-145，发行规模<3亿（非未转股余额），向下波动有限，弹性高",
         data_date=bonds[0].data_date if bonds else ""
     )
 
@@ -113,7 +120,7 @@ def jgb_low_price_low_premium(bonds: List[BondVO]) -> StrategyResultVO:
     return StrategyResultVO(
         strategy_name="检钢蹦-低价低溢价", strategy_key="jgb_low_price_low_premium",
         bonds=selected,
-        filter_desc="价格<140，溢价20-60%，0.5-5.5年，规模<10亿，波段好手",
+        filter_desc="价格<140，溢价20-60%，0.5-5.5年，发行规模<10亿，波段好手",
         data_date=bonds[0].data_date if bonds else ""
     )
 
@@ -129,7 +136,7 @@ def jgb_defensive(bonds: List[BondVO]) -> StrategyResultVO:
     return StrategyResultVO(
         strategy_name="检钢蹦-防守型", strategy_key="jgb_defensive",
         bonds=selected,
-        filter_desc="价格<130，溢价50-90%，规模<10亿，防守为主",
+        filter_desc="价格<130，溢价50-90%，发行规模<10亿，防守为主",
         data_date=bonds[0].data_date if bonds else ""
     )
 
@@ -145,7 +152,7 @@ def jgb_active(bonds: List[BondVO]) -> StrategyResultVO:
     return StrategyResultVO(
         strategy_name="检钢蹦-活跃品种", strategy_key="jgb_active",
         bonds=selected,
-        filter_desc="价格120-155，弹性>0.05，规模<15亿，概念丰富",
+        filter_desc="价格120-155，弹性>0.05，发行规模<15亿，概念丰富",
         data_date=bonds[0].data_date if bonds else ""
     )
 

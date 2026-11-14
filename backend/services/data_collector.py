@@ -169,18 +169,21 @@ class EastMoneyDataCenter:
         code = str(item.get("SECURITY_CODE", "") or "")
         if not code:
             return None, None
-        exec_price_sh = cls._safe_float(item.get("EXECUTE_PRICE_SH"))
-        exec_price_hs = cls._safe_float(item.get("EXECUTE_PRICE_HS"))
+        par_value = cls._safe_float(item.get("PAR_VALUE"), 100.0)
+        # REDEEM_CLAUSE 是「到期赎回条款」原文，真实赎回价唯一权威来源。
+        # EXECUTE_PRICE_SH/HS 是**强赎执行价**，与此无关，绝不能混用。
+        clause = str(item.get("REDEEM_CLAUSE", "") or "")
         return code, {
             "maturity_date": str(item.get("EXPIRE_DATE", "") or ""),
             "delist_date": str(item.get("DELIST_DATE", "") or ""),
             "interest_rate_explain": str(item.get("INTEREST_RATE_EXPLAIN", "") or ""),
             "issue_size": cls._safe_float(item.get("ACTUAL_ISSUE_SCALE")),
             "rating": str(item.get("RATING", "") or ""),
-            "maturity_redeem_price": exec_price_sh if exec_price_sh > 0 else exec_price_hs,
+            "maturity_redeem_price": parse_maturity_redeem_price(clause, par_value) or 0.0,
+            "redeem_clause": clause,
             "value_date": str(item.get("VALUE_DATE", "") or ""),
             "bond_expire": cls._safe_float(item.get("BOND_EXPIRE")),
-            "par_value": cls._safe_float(item.get("PAR_VALUE"), 100.0),
+            "par_value": par_value,
         }
 
     @staticmethod
@@ -208,6 +211,35 @@ def parse_coupon_rates(explain: str) -> List[float]:
     # 兜底：匹配所有百分比
     matches = re.findall(r'([\d.]+)%', explain)
     return [float(m) for m in matches] if matches else []
+
+
+# 「(1)到期赎回条款」段里写的赎回比例。只取第 (1) 段，
+# 避免把 (2) 有条件赎回里的 130% / 回售条款里的 70% 误当成赎回价。
+_REDEEM_PCT = re.compile(r"面值(?:的|上浮)?\s*(\d{2,3}(?:\.\d+)?)\s*%")
+
+
+def parse_maturity_redeem_price(clause: str, par_value: float = 100.0) -> Optional[float]:
+    """从东财 REDEEM_CLAUSE 解析真实到期赎回价（元），解析不到返回 None。
+
+    实测 2026-11-14 活跃 310/310 只可解析，覆盖两种写法：
+      「票面面值的110.00%(含最后一期利息)」→ 110.0
+      「票面面值上浮115%(含最后一期利息)」→ 115.0
+    ⚠️ 绝不要用 `EXECUTE_PRICE_SH/HS`（那是**强赎执行价**，多数债为 None），
+    也不要用「面值 100 + 末期票息 ≈102」推算：真实值多在 106~120，
+    2026-11-14 实测 304/310 只被低估，最大差 19.72 元，YTM 平均偏 5.66pp。
+    """
+    if not clause:
+        return None
+    seg = clause.split("(2)")[0] if "(2)" in clause else clause[:300]
+    seg = seg.split("有条件赎回")[0]
+    m = _REDEEM_PCT.search(seg)
+    if not m:
+        return None
+    price = par_value * float(m.group(1)) / 100.0
+    # 合理区间保护：面值 100 的可转债到期赎回价历史区间约 100~130
+    if not (100.0 <= price <= 200.0):
+        return None
+    return round(price, 2)
 
 
 # ========== AKShare 采集器 ==========
@@ -383,6 +415,11 @@ class AKShareCollector:
             "convert_price": gf("转股价"),
             "convert_value": gf("转股价值"),
             "premium_rate": gf("转股溢价率"),
+            # ⚠️ 口径纠正（2026-11-14）：AKShare bond_zh_cov() 只有「发行规模」
+            # （东财 ACTUAL_ISSUE_SCALE），**没有**「剩余规模 / 未转股余额」。
+            # 字段名沿用 remaining_size 只为兼容既有 DB / VO / 前端，语义是发行规模（亿元）。
+            # 集思录匿名接口只返回 30 只、东财报表也无该字段 ⇒ 无稳定全量真值源，
+            # 按「宁缺毋假」不编造余额：UI 列标题与策略 filter_desc 一律写「发行规模」。
             "remaining_size": gf("发行规模"),
             "remaining_years": 0.0,
             "maturity_date": "",
@@ -427,7 +464,8 @@ class AKShareCollector:
         except (ValueError, TypeError):
             pass
 
-        # 换手率 = 成交量 / 剩余规模对应的张数 * 100
+        # 换手率 = 成交量 / 发行规模对应张数 * 100
+        # ⚠️ 分母是发行规模近似值（非真实未转股余额），会系统性低估换手率，属已知口径限制。
         try:
             volume = float(row.get("volume", 0) or 0)
             if bond["remaining_size"] > 0:
@@ -539,24 +577,22 @@ class AKShareCollector:
             bond["put_trigger_price"] = round(cp * 0.7, 2)
 
     def _calc_maturity_redeem_price(self, bond: Dict, terms: Optional[Dict]):
-        """计算到期赎回价（数据中心对活跃转债没有，从利率说明推算）"""
+        """到期赎回价唯一口径：东财「到期赎回条款」原文解析出的真值。
+
+        2026-11-14 之前这里用「面值 100 + 末期票息 ≈102」推算，并把 105 当默认值，
+        实测 304/310 只被低估（真实 106~120，最大差 19.72 元），导致全市场 YTM 失真。
+        现在解析不到就保持 0，让 YTM / 纯债价值跳过计算 —— 宁缺毋假，不编造现金流。
+        """
         if bond["maturity_redeem_price"] > 0:
-            return  # 已有值
-
+            return  # 条款缓存里已是真值
         if not terms:
-            bond["maturity_redeem_price"] = 105.0  # 常见默认值
             return
-
-        explain = terms.get("interest_rate_explain", "")
-        rates = parse_coupon_rates(explain)
-        par = terms.get("par_value", 100.0)
-
-        if rates:
-            # 到期赎回价 = 面值 + 最后一期利息（最低估算，实际可能还有补偿利息）
-            last_rate = rates[-1]
-            bond["maturity_redeem_price"] = round(par + par * last_rate / 100, 2)
-        else:
-            bond["maturity_redeem_price"] = 105.0
+        parsed = parse_maturity_redeem_price(
+            terms.get("redeem_clause", ""),
+            terms.get("par_value", 100.0) or 100.0,
+        )
+        if parsed:
+            bond["maturity_redeem_price"] = parsed
 
     def _calc_put_value(self, bond: Dict):
         """计算回售价值（通常=面值+当期利息，暂用100作为保守估计）"""

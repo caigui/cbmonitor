@@ -19,6 +19,7 @@ from models.database import db_manager, init_database, CBRecord
 from models.schemas import BondVO, StrategyResultVO, DataStatusVO
 from services.realtime_service import realtime
 from services.strategy_engine import run_strategy, ALL_STRATEGIES
+from services.calc_engine import bond_risk_flag
 
 # 日志配置
 logging.basicConfig(
@@ -65,6 +66,7 @@ def _record_to_vo(record: CBRecord) -> BondVO:
         remaining_size=record.remaining_size or 0.0,
         maturity_date=record.maturity_date or "",
         credit_rating=record.credit_rating or "",
+        risk_flag=bond_risk_flag(record.stock_name or "", record.credit_rating or ""),
         pure_bond_value=record.pure_bond_value or 0.0,
         put_value=record.put_value or 0.0,
         elasticity=record.elasticity or 0.0,
@@ -87,7 +89,12 @@ def _current_bonds() -> List[BondVO]:
     merged = realtime.get_bonds()
     if merged:
         # Pydantic 默认忽略多余字段（list_date / maturity_redeem_price / _terms 等）
-        return [BondVO(**b) for b in merged]
+        vos = [BondVO(**b) for b in merged]
+        # 风险标识统一在此计算（规则只在 calc_engine.bond_risk_flag 一处），
+        # 主看板 / 8 个策略集 / 刷新接口共用同一份 VO，不会出现口径分叉。
+        for v in vos:
+            v.risk_flag = bond_risk_flag(v.stock_name, v.credit_rating)
+        return vos
     return [_record_to_vo(r) for r in db_manager.get_latest_bonds()]
 
 

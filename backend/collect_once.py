@@ -85,6 +85,7 @@ def quality_gate(bonds, terms, today: str):
         return False, f"条数过少: {len(bonds)} < {MIN_BONDS}"
     if len(terms) < MIN_TERMS:
         return False, f"东财条款不完整: {len(terms)} < {MIN_TERMS}（退市债过滤会失灵）"
+    no_redeem = []
     for b in bonds:
         code = b.get("bond_code", "")
         name = b.get("bond_name", "")
@@ -93,7 +94,14 @@ def quality_gate(bonds, terms, today: str):
             return False, f"疑似退市债混入: {code} {name}"
         if maturity and maturity < today:
             return False, f"已到期债混入: {code} {name} maturity={maturity}"
-    return True, f"条数 {len(bonds)} / 条款 {len(terms)} / 无到期退市债"
+        # 到期赎回价来自 REDEEM_CLAUSE 解析，解析不到时 YTM 会跳过计算。
+        # 允许个别特殊条款缺失，但大面积缺失说明条款格式变了或缓存回退旧版 ⇒ 拒绝写库。
+        if not (b.get("maturity_redeem_price") or 0) > 0:
+            no_redeem.append(code)
+    if len(no_redeem) > 10:
+        return False, f"到期赎回价缺失 {len(no_redeem)} 只 > 10（YTM 会大面积失真）: {no_redeem[:5]}"
+    return True, (f"条数 {len(bonds)} / 条款 {len(terms)} / 无到期退市债"
+                  f" / 缺赎回价 {len(no_redeem)} 只")
 
 
 def main() -> int:
@@ -127,10 +135,17 @@ def main() -> int:
     logger.info("[%s] 开始采集 %s", mode, today)
     cached = db_manager.get_terms()
     age = db_manager.terms_refresh_age_days()
-    need_full = (args.full_terms or not cached
+    # 条款缓存 schema 自愈：2026-11-14 前缓存里没有 redeem_clause（到期赎回条款原文），
+    # maturity_redeem_price 取的是强赎执行价（多为 0），到期赎回价只能靠推算 ⇒ YTM 失真。
+    # 检测到旧格式就强制全量重建，避免手工迁移、也避免下次增量继续沿用旧值。
+    stale_schema = bool(cached) and not any(
+        "redeem_clause" in (t or {}) for t in cached.values()
+    )
+    need_full = (args.full_terms or not cached or stale_schema
                  or (age is not None and age >= TERMS_REFRESH_DAYS))
-    logger.info("[%s] 条款缓存 %d 条 / 最老 %.1f 天 ⇒ %s",
+    logger.info("[%s] 条款缓存 %d 条 / 最老 %.1f 天 / 旧格式=%s ⇒ %s",
                 mode, len(cached), age if age is not None else -1,
+                stale_schema,
                 "全量重建" if need_full else "只查新债（增量）")
     try:
         bonds, terms, added = collector.collect_with_terms(
