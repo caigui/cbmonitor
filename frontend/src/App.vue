@@ -69,39 +69,34 @@
       </div>
     </main>
 
-    <!-- 老实和尚策略 Tab -->
-    <main v-else-if="activeTab === 'lao'" class="main-content">
-      <div class="strategy-tabs">
-        <button
-          v-for="s in laoStrategies"
-          :key="s.key"
-          :class="['strategy-btn', { active: activeStrategy === s.key }]"
-          @click="loadStrategy(s.key)"
-        >{{ s.label }}</button>
+    <!-- 策略 Tab：两组按钮，组标签不可点，用来区分「排序取前N」和「多条件区间框选」 -->
+    <main v-else-if="activeTab === 'strategy'" class="main-content">
+      <div class="strategy-groups">
+        <div class="strategy-group" v-for="g in strategyGroups" :key="g.type">
+          <span class="group-label" :title="g.title">{{ g.label }}</span>
+          <button
+            v-for="s in g.items"
+            :key="s.key"
+            :class="['strategy-btn', { active: activeStrategy === s.key }]"
+            @click="loadStrategy(s.key)"
+          >{{ s.label }}</button>
+        </div>
       </div>
       <div class="filter-desc" v-if="strategyResult">
-        筛选条件：{{ strategyResult.filter_desc }}
+        <span>筛选条件：{{ strategyResult.filter_desc }}</span>
+        <span class="fd-right">
+          <span class="fd-tag">{{ isPoolStrategy ? '候选池' : '排序' }}</span>
+          <span class="fd-count">共 {{ strategyTotal }} 只</span>
+          <span v-if="activeStrategy === 'jgb_active'" class="fd-warn">宽口径池</span>
+          <button
+            v-if="strategyTotal > SHOW_LIMIT"
+            class="fd-more"
+            @click="strategyExpanded = !strategyExpanded"
+          >{{ strategyExpanded ? '收起' : '展开全部' }}</button>
+        </span>
       </div>
       <div class="table-area">
-        <CBTable :bonds="strategyResult?.bonds || []" :loading="strategyLoading" />
-      </div>
-    </main>
-
-    <!-- 检钢蹦策略 Tab -->
-    <main v-else-if="activeTab === 'jgb'" class="main-content">
-      <div class="strategy-tabs">
-        <button
-          v-for="s in jgbStrategies"
-          :key="s.key"
-          :class="['strategy-btn', { active: activeStrategy === s.key }]"
-          @click="loadStrategy(s.key)"
-        >{{ s.label }}</button>
-      </div>
-      <div class="filter-desc" v-if="strategyResult">
-        筛选条件：{{ strategyResult.filter_desc }}
-      </div>
-      <div class="table-area">
-        <CBTable :bonds="strategyResult?.bonds || []" :loading="strategyLoading" />
+        <CBTable :bonds="visibleStrategyBonds" :loading="strategyLoading" />
       </div>
     </main>
   </div>
@@ -114,26 +109,56 @@ import { getBonds, getStrategy, getStatus, type BondVO, type StrategyResultVO, t
 
 const tabs = [
   { key: 'all', label: '全部转债' },
-  { key: 'lao', label: 'A策略集' },
-  { key: 'jgb', label: 'B策略集' }
+  { key: 'strategy', label: '策略' }
 ]
 
-const laoStrategies = [
-  { key: 'double_low', label: '双低' },
-  { key: 'low_premium', label: '低溢价' },
-  { key: 'low_price', label: '低价' },
-  { key: 'high_yield', label: '高收益率' }
-]
-
-const jgbStrategies = [
-  { key: 'jgb_micro_cap', label: '微盘转债' },
-  { key: 'jgb_low_price_low_premium', label: '低价低溢价' },
-  { key: 'jgb_defensive', label: '防守型' },
-  { key: 'jgb_active', label: '活跃品种' }
+// 两组策略，区别是「用法」不是「来源」：
+//   全市场排序 = 按单一指标把 300+ 只排一遍取前 N，用来看极端值（谁最便宜、谁的收益率最高）；
+//   候选池    = 多条件区间筛选，输出符合条件的候选，不做名次比较。
+// 名字不用「榜」「温度计」这类词：页面既没有综合打分，也没有温度数值，
+// 叫「排序」就是它实际在做的事，不制造不存在的概念。
+// 2026-11-14 实测两组并集交集仅 3 只（Jaccard 1.7%），不是重复菜单。
+// 8 个 key 与后端 ALL_STRATEGIES 一一对应，改这里不需要动后端。
+const strategyGroups = [
+  {
+    type: 'rank',
+    label: '全市场排序',
+    title: '对全部转债按单一指标排序取前 10 只：看极端值，不当作买入清单',
+    items: [
+      { key: 'double_low', label: '双低' },
+      { key: 'low_premium', label: '低溢价' },
+      { key: 'low_price', label: '低价' },
+      { key: 'high_yield', label: '高收益率' }
+    ]
+  },
+  {
+    type: 'pool',
+    label: '候选池',
+    title: '多条件区间筛选：输出符合条件的候选，不做名次比较',
+    items: [
+      { key: 'jgb_micro_cap', label: '微盘转债' },
+      { key: 'jgb_low_price_low_premium', label: '中小盘波段' },
+      { key: 'jgb_defensive', label: '防守型' },
+      { key: 'jgb_active', label: '活跃品种' }
+    ]
+  }
 ]
 
 const activeTab = ref('all')
 const activeStrategy = ref('double_low')
+// 只用于界面徽标区分「排序 / 候选池」，不参与任何请求参数
+const isPoolStrategy = computed(() => activeStrategy.value.startsWith('jgb_'))
+
+// 候选池动辄几十上百只，全铺出来就失去「候选」的意义。
+// 默认只显示前 10 条，需要看全集再点「展开全部」——截断只发生在展示层，
+// 后端仍返回全部，筛选口径一个字没改。
+const SHOW_LIMIT = 10
+const strategyExpanded = ref(false)
+const strategyTotal = computed(() => strategyResult.value?.bonds?.length || 0)
+const visibleStrategyBonds = computed(() => {
+  const list = strategyResult.value?.bonds || []
+  return strategyExpanded.value ? list : list.slice(0, SHOW_LIMIT)
+})
 const bonds = ref<BondVO[]>([])
 const strategyResult = ref<StrategyResultVO | null>(null)
 const status = ref<DataStatusVO | null>(null)
@@ -224,6 +249,8 @@ async function loadBonds() {
 
 async function loadStrategy(key: string) {
   activeStrategy.value = key
+  // 换策略时回到"只看前 10"，避免带着上一池的展开状态看新池子
+  strategyExpanded.value = false
   strategyLoading.value = true
   try {
     const res = await getStrategy(key)
@@ -358,7 +385,21 @@ html, body { height: 100%; overflow: hidden; }
 .filter-reset:hover { background: #f0f5ff; }
 
 /* flex-shrink:0：策略 Tab 下这两个元素是 .table-area 的兄弟，不固定就会被表格挤扁 */
-.strategy-tabs { display: flex; gap: 4px; margin-bottom: 8px; flex-wrap: wrap; flex-shrink: 0; }
+.strategy-groups {
+  display: flex; align-items: center; gap: 4px;
+  margin-bottom: 8px; flex-wrap: wrap; flex-shrink: 0;
+}
+.strategy-group { display: flex; align-items: center; gap: 4px; }
+/* 两组之间一条竖线，视觉上把「排序」和「候选池」切开；
+   候选池这组与左侧四个按钮之间留更大的呼吸，避免连成一片 */
+.strategy-group + .strategy-group {
+  padding-left: 26px; margin-left: 20px; border-left: 1px solid #dcdfe6;
+}
+/* 组名用深色加粗压过按钮，让人先看到「这是两类东西」 */
+.group-label {
+  font-size: 13px; color: #2c3e50; font-weight: 600; white-space: nowrap;
+  margin-right: 5px; cursor: help; letter-spacing: 0.2px;
+}
 .strategy-btn {
   padding: 5px 14px; border: 1px solid #e0e6ed; background: #fafafa;
   border-radius: 6px; cursor: pointer; font-size: 13px; color: #606266;
@@ -367,10 +408,27 @@ html, body { height: 100%; overflow: hidden; }
 .strategy-btn:hover { background: #f0f5ff; }
 .strategy-btn.active { background: #67c23a; color: #fff; border-color: #67c23a; }
 .filter-desc {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
   padding: 6px 12px; background: #fdf6ec; border: 1px solid #faecd8;
   border-radius: 4px; font-size: 12px; color: #e6a23c; margin-bottom: 8px;
   flex-shrink: 0;
 }
+.fd-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.fd-tag {
+  padding: 1px 6px; border-radius: 3px; font-size: 11px;
+  background: #f0f5ff; border: 1px solid #d6e4f0; color: #4a90d9;
+}
+.fd-count { font-size: 11.5px; color: #909399; white-space: nowrap; }
+.fd-warn {
+  padding: 1px 6px; border-radius: 3px; font-size: 11px;
+  background: #fff4e5; border: 1px solid #f0d0a0; color: #b9741a;
+}
+.fd-more {
+  padding: 1px 8px; border-radius: 3px; font-size: 11px; cursor: pointer;
+  background: #fff; border: 1px solid #dcdfe6; color: #4a90d9;
+  font-family: inherit;
+}
+.fd-more:hover { background: #f0f5ff; border-color: #c0d8f0; }
 
 /* ============ 手机适配（2026-09-27 新增）============
    原样式是桌面端设计：顶栏三区块（标题 / 3个Tab / 状态+刷新）挤在一行，
@@ -395,7 +453,16 @@ html, body { height: 100%; overflow: hidden; }
   .tab-btn { flex: 1 1 0; padding: 6px 4px; font-size: 13px; white-space: nowrap; }
 
   .main-content { padding: 5px; }
+  /* 窄屏两组各占一行：竖线换成行间距，避免换行后竖线悬在行首 */
+  .strategy-groups { gap: 3px; }
+  .strategy-group + .strategy-group {
+    padding-left: 0; margin-left: 0; border-left: 0;
+    width: 100%; margin-top: 2px;
+  }
+  .group-label { font-size: 12px; margin-right: 4px; }
   .strategy-btn { padding: 5px 11px; font-size: 12.5px; }
+  .filter-desc { flex-wrap: wrap; row-gap: 3px; line-height: 1.5; }
+  .fd-right { margin-left: auto; }
   .filter-bar { padding: 5px 7px; }
   .filter-reset { margin-left: 4px; }
 }

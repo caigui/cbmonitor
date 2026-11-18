@@ -1,5 +1,17 @@
 """
-策略引擎 - 老实和尚4策略 + 检钢蹦4类选债
+策略引擎 - 两组策略，区别在「用法」不在「来源」：
+
+  全市场排序（double_low / low_premium / low_price / high_yield）
+      全市场按单一指标排序取前 N 只。单值可比、可画成曲线，
+      用来看极端值（谁最便宜、谁的收益率最高），不适合直接当买入清单。
+      口径来自集思录长期公开的四个通用统计维度。
+
+  候选池（jgb_*）
+      多条件区间筛选，输出候选，不做名次比较。
+      源自集思录「捡钢镚」的四类分类选债思路。
+
+2026-11-14 实测两组并集交集仅 3 只（Jaccard 1.7%），name 相似不等于重复：
+「低价低溢价」设了溢价下界 20%，恰好把双低榜（溢价全 <20%）整批排除。
 """
 import logging
 from typing import List, Dict
@@ -34,7 +46,7 @@ def _filter_basic(bonds: List[BondVO]) -> List[BondVO]:
     return result
 
 
-# ========== 老实和尚策略 ==========
+# ========== 全市场排序（通用统计口径，取前 N 看极端值） ==========
 
 def strategy_double_low(bonds: List[BondVO], n: int = 10) -> StrategyResultVO:
     """双低策略：双低值升序取前N"""
@@ -93,7 +105,7 @@ def strategy_high_yield(bonds: List[BondVO], n: int = 10) -> StrategyResultVO:
     )
 
 
-# ========== 检钢蹦策略 ==========
+# ========== 候选池（多条件区间筛选，输出候选不是排名） ==========
 
 def jgb_micro_cap(bonds: List[BondVO]) -> StrategyResultVO:
     """第1类：微盘转债 - 价格~130，规模<3亿"""
@@ -101,7 +113,7 @@ def jgb_micro_cap(bonds: List[BondVO]) -> StrategyResultVO:
     selected = [b for b in filtered if 115 <= b.bond_price <= 145 and 0 < b.remaining_size < 3]
     selected.sort(key=lambda x: x.bond_price)
     return StrategyResultVO(
-        strategy_name="检钢蹦-微盘转债", strategy_key="jgb_micro_cap",
+        strategy_name="捡钢镚-微盘转债", strategy_key="jgb_micro_cap",
         bonds=selected,
         filter_desc="价格115-145，发行规模<3亿（非未转股余额），向下波动有限，弹性高",
         data_date=bonds[0].data_date if bonds else ""
@@ -118,9 +130,9 @@ def jgb_low_price_low_premium(bonds: List[BondVO]) -> StrategyResultVO:
                 and 0 < b.remaining_size < 10]
     selected.sort(key=lambda x: x.bond_price)
     return StrategyResultVO(
-        strategy_name="检钢蹦-低价低溢价", strategy_key="jgb_low_price_low_premium",
+        strategy_name="捡钢镚-中小盘波段", strategy_key="jgb_low_price_low_premium",
         bonds=selected,
-        filter_desc="价格<140，溢价20-60%，0.5-5.5年，发行规模<10亿，波段好手",
+        filter_desc="价格<140，溢价20-60%，0.5-5.5年，发行规模<10亿；区间框选，溢价下界 20% 与双低榜天然不重叠",
         data_date=bonds[0].data_date if bonds else ""
     )
 
@@ -134,7 +146,7 @@ def jgb_defensive(bonds: List[BondVO]) -> StrategyResultVO:
                 and 0 < b.remaining_size < 10]
     selected.sort(key=lambda x: x.bond_price)
     return StrategyResultVO(
-        strategy_name="检钢蹦-防守型", strategy_key="jgb_defensive",
+        strategy_name="捡钢镚-防守型", strategy_key="jgb_defensive",
         bonds=selected,
         filter_desc="价格<130，溢价50-90%，发行规模<10亿，防守为主",
         data_date=bonds[0].data_date if bonds else ""
@@ -150,7 +162,7 @@ def jgb_active(bonds: List[BondVO]) -> StrategyResultVO:
                 and b.remaining_size < 15]
     selected.sort(key=lambda x: x.elasticity, reverse=True)
     return StrategyResultVO(
-        strategy_name="检钢蹦-活跃品种", strategy_key="jgb_active",
+        strategy_name="捡钢镚-活跃品种", strategy_key="jgb_active",
         bonds=selected,
         filter_desc="价格120-155，弹性>0.05，发行规模<15亿，概念丰富",
         data_date=bonds[0].data_date if bonds else ""
