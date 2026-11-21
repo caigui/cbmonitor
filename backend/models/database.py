@@ -76,6 +76,9 @@ class CBRecord(Base):
 
     pure_bond_value = Column(Float, default=0.0)
     put_value = Column(Float, default=0.0)
+    # 到期赎回价（含末期利息，东财 REDEEM_CLAUSE 真值）。DB 表已有此列（迁移加入），
+    # ORM 模型补声明后 C 策略「临期债」才能从快照读到真值（否则 getattr 恒为 0）。
+    maturity_redeem_price = Column(Float, default=0.0)
     elasticity = Column(Float, default=0.0)
     pb_ratio = Column(Float, default=0.0)
 

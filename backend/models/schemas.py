@@ -29,6 +29,8 @@ class BondVO(BaseModel):
     risk_flag: str = ""
     pure_bond_value: float = 0.0
     put_value: float = 0.0
+    # 到期赎回价（含末期利息，来自东财 REDEEM_CLAUSE 真值）；C 策略「临期债」依赖此字段
+    maturity_redeem_price: float = 0.0
     elasticity: float = 0.0
     pb_ratio: float = 0.0
     redeem_trigger_price: float = 0.0

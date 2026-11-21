@@ -69,6 +69,9 @@ def _record_to_vo(record: CBRecord) -> BondVO:
         risk_flag=bond_risk_flag(record.stock_name or "", record.credit_rating or ""),
         pure_bond_value=record.pure_bond_value or 0.0,
         put_value=record.put_value or 0.0,
+        # 到期赎回价存于 payload JSON（非独立列）；DB 回退路径取不到则留 0，
+        # 主路径 _current_bonds() 由 realtime 字典直接带值。C 策略「临期债」依赖此字段。
+        maturity_redeem_price=getattr(record, "maturity_redeem_price", 0.0) or 0.0,
         elasticity=record.elasticity or 0.0,
         pb_ratio=record.pb_ratio or 0.0,
         redeem_trigger_price=record.redeem_trigger_price or 0.0,
@@ -88,7 +91,7 @@ def _current_bonds() -> List[BondVO]:
     """主看板数据：静态档案 + 盘中实时行情（内存），档案未就绪时回退 DB 最新快照。"""
     merged = realtime.get_bonds()
     if merged:
-        # Pydantic 默认忽略多余字段（list_date / maturity_redeem_price / _terms 等）
+        # BondVO 已声明 maturity_redeem_price，realtime 字典带此字段会正确透传（C 策略依赖）
         vos = [BondVO(**b) for b in merged]
         # 风险标识统一在此计算（规则只在 calc_engine.bond_risk_flag 一处），
         # 主看板 / 8 个策略集 / 刷新接口共用同一份 VO，不会出现口径分叉。
@@ -104,6 +107,13 @@ def _current_bonds() -> List[BondVO]:
 async def on_startup():
     init_database()
     await realtime.start()
+    # C 策略集钉钉提醒（从 master 增量移植）：daemon 线程，失败不影响主服务
+    try:
+        from strategy_c_alert import start_background
+        start_background(interval=3600)
+        logger.info("C策略集提醒线程已启动（每 1 小时）")
+    except Exception as e:
+        logger.warning("C策略集提醒线程启动失败（不影响主服务）: %s" % e)
 
 
 @app.on_event("shutdown")

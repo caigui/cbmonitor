@@ -24,12 +24,29 @@ RATING_ORDER = ["AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+", "BBB", "BBB-
 MIN_RATING = "A-"  # 剔除 A- 以下
 
 
-def _rating_ok(rating: str) -> bool:
-    """评级是否 >= A-"""
+def _norm_rating(rating: str) -> str:
+    """归一化评级符号：'AA+sti' -> 'AA+'，'AAsti' -> 'AA'，'AA-sti' -> 'AA-'。
+
+    sti = Science Technology Innovation（科技创新）特殊标识，由评级机构加注在
+    「采用科创企业评级方法评定」或「募集资金投向科创领域」的债项评级后。
+    它只是评级方法/用途标识，等级符号本身（AA+/AA/AA- ...）与普通评级同义，
+    判断评级高低时截掉 sti 即可；不能把它理解成「私募」或「无评级」。
+    """
     if not rating:
+        return ""
+    import re as _re
+    s = str(rating).strip().upper().replace(" ", "")
+    m = _re.match(r'^(AAA|AA\+|AA-|AA|A\+|A-|A|BBB\+|BBB-|BBB|BB|B\+|B-|B|CCC|CC|C|D)', s)
+    return m.group(1) if m else s
+
+
+def _rating_ok(rating: str) -> bool:
+    """评级是否 >= A-（先归一化 sti 科创标识，避免科创债被误剔除）"""
+    r = _norm_rating(rating)
+    if not r:
         return False
     try:
-        return RATING_ORDER.index(rating) <= RATING_ORDER.index(MIN_RATING)
+        return RATING_ORDER.index(r) <= RATING_ORDER.index(MIN_RATING)
     except ValueError:
         return False
 
@@ -169,6 +186,73 @@ def jgb_active(bonds: List[BondVO]) -> StrategyResultVO:
     )
 
 
+# ========== C 策略集（临期债 / 收益率为正 / 面值债）==========
+# 从 cbmonitor-master 增量移植；评级判断复用本文件的 _norm_rating（兼容 AA+sti 科创标识）。
+
+def _rating_ge_aa_minus(rating: str) -> bool:
+    """评级是否 >= AA-（AA / AA+ / AAA 均通过；AA-sti 归一化后也算 AA-）。"""
+    r = _norm_rating(rating)
+    tier = {"AAA": 0, "AA+": 1, "AA": 2, "AA-": 3}
+    return r in tier  # tier 里的都 >= AA-
+
+
+def strategy_near_maturity(bonds: List[BondVO], n: int = 0) -> StrategyResultVO:
+    """临期债：剩余年限 < 0.5 年，且 现价 - 到期赎回价 < 1 元。
+
+    到期赎回价（含末期利息）来自东方财富 REDEEM_CLAUSE；现价与它的价差 < 1 元，
+    意味着现价已接近（或低于）到期可得金额，持有到期的确定性收益/低风险特征明显。
+    n=0 表示不截断，返回全部命中（策略筛选用）。
+    """
+    selected = []
+    for b in bonds:
+        if b.remaining_years <= 0 or b.remaining_years >= 0.5:
+            continue
+        if b.maturity_redeem_price <= 0:      # 无到期赎回价数据 → 不判断
+            continue
+        gap = b.bond_price - b.maturity_redeem_price
+        if gap < 1.0:
+            selected.append(b)
+    selected.sort(key=lambda x: (x.remaining_years, x.bond_price))
+    if n and n > 0:
+        selected = selected[:n]
+    return StrategyResultVO(
+        strategy_name="临期债", strategy_key="near_maturity",
+        bonds=selected,
+        filter_desc="剩余年限<0.5年，且现价-到期赎回价<1元（到期赎回价含末期利息，来自东财条款）",
+        data_date=bonds[0].data_date if bonds else ""
+    )
+
+
+def strategy_positive_yield(bonds: List[BondVO], n: int = 0) -> StrategyResultVO:
+    """收益率为正：税前收益率 > 1%，且评级 AA- 及以上。"""
+    selected = [b for b in bonds
+                if b.pre_tax_yield > 1.0 and _rating_ge_aa_minus(b.credit_rating)]
+    selected.sort(key=lambda x: x.pre_tax_yield, reverse=True)
+    if n and n > 0:
+        selected = selected[:n]
+    return StrategyResultVO(
+        strategy_name="收益率为正", strategy_key="positive_yield",
+        bonds=selected,
+        filter_desc="税前收益率>1%，且评级AA-及以上",
+        data_date=bonds[0].data_date if bonds else ""
+    )
+
+
+def strategy_par_bond(bonds: List[BondVO], n: int = 0) -> StrategyResultVO:
+    """面值债：现价 < 104 元，且评级 AA- 及以上。"""
+    selected = [b for b in bonds
+                if 0 < b.bond_price < 104.0 and _rating_ge_aa_minus(b.credit_rating)]
+    selected.sort(key=lambda x: x.bond_price)
+    if n and n > 0:
+        selected = selected[:n]
+    return StrategyResultVO(
+        strategy_name="面值债", strategy_key="par_bond",
+        bonds=selected,
+        filter_desc="现价<104元，且评级AA-及以上",
+        data_date=bonds[0].data_date if bonds else ""
+    )
+
+
 # ========== 策略路由 ==========
 
 ALL_STRATEGIES = {
@@ -180,7 +264,14 @@ ALL_STRATEGIES = {
     "jgb_low_price_low_premium": jgb_low_price_low_premium,
     "jgb_defensive": jgb_defensive,
     "jgb_active": jgb_active,
+    # C 策略集
+    "near_maturity": strategy_near_maturity,
+    "positive_yield": strategy_positive_yield,
+    "par_bond": strategy_par_bond,
 }
+
+# 不截断（返回全部命中）的 C 策略；A/B 策略默认取前 N
+_NO_LIMIT_STRATEGIES = {"near_maturity", "positive_yield", "par_bond"}
 
 
 def run_strategy(key: str, bonds: List[BondVO], n: int = 10) -> StrategyResultVO:
@@ -190,4 +281,7 @@ def run_strategy(key: str, bonds: List[BondVO], n: int = 10) -> StrategyResultVO
         return StrategyResultVO(strategy_name="未知策略", strategy_key=key, filter_desc=f"策略 {key} 不存在")
     if key in ("double_low", "low_premium", "low_price", "high_yield"):
         return func(bonds, n)
+    if key in _NO_LIMIT_STRATEGIES:
+        # C 策略默认全量命中；仅当调用方显式传 n（且 != 默认 10）时才截断
+        return func(bonds, 0)
     return func(bonds)

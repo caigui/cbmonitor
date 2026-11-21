@@ -85,7 +85,7 @@
       <div class="filter-desc" v-if="strategyResult">
         <span>筛选条件：{{ strategyResult.filter_desc }}</span>
         <span class="fd-right">
-          <span class="fd-tag">{{ isPoolStrategy ? '候选池' : '排序' }}</span>
+          <span class="fd-tag">{{ isPoolStrategy ? '候选池' : (isCStrategy ? 'C策略集·提醒' : '排序') }}</span>
           <span class="fd-count">共 {{ strategyTotal }} 只</span>
           <span v-if="activeStrategy === 'jgb_active'" class="fd-warn">宽口径池</span>
           <button
@@ -141,13 +141,24 @@ const strategyGroups = [
       { key: 'jgb_defensive', label: '防守型' },
       { key: 'jgb_active', label: '活跃品种' }
     ]
+  },
+  {
+    type: 'c',
+    label: 'C策略集',
+    title: '临期债 / 收益率为正 / 面值债：全量命中，另有钉钉提醒（每 1 小时）',
+    items: [
+      { key: 'near_maturity', label: '临期债' },
+      { key: 'positive_yield', label: '收益率为正' },
+      { key: 'par_bond', label: '面值债' }
+    ]
   }
 ]
 
 const activeTab = ref('all')
 const activeStrategy = ref('double_low')
-// 只用于界面徽标区分「排序 / 候选池」，不参与任何请求参数
+// 只用于界面徽标区分「排序 / 候选池 / C策略集」，不参与任何请求参数
 const isPoolStrategy = computed(() => activeStrategy.value.startsWith('jgb_'))
+const isCStrategy = computed(() => ['near_maturity', 'positive_yield', 'par_bond'].includes(activeStrategy.value))
 
 // 候选池动辄几十上百只，全铺出来就失去「候选」的意义。
 // 默认只显示前 10 条，需要看全集再点「展开全部」——截断只发生在展示层，

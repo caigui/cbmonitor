@@ -26,6 +26,7 @@
           <th class="sortable" @click="toggleSort('pb_ratio')">P/B <span class="arrow">{{ sortArrow('pb_ratio') }}</span></th>
           <th class="sortable" @click="toggleSort('remaining_years')">剩余年限 <span class="arrow">{{ sortArrow('remaining_years') }}</span></th>
           <th>到期时间</th>
+          <th class="sortable" @click="toggleSort('maturity_redeem_price')">到期赎回价 <span class="arrow">{{ sortArrow('maturity_redeem_price') }}</span></th>
           <th class="sortable" @click="toggleSort('remaining_size')">发行规模 <span class="arrow">{{ sortArrow('remaining_size') }}</span></th>
           <th class="sortable" @click="toggleSort('turnover_rate')">换手率 <span class="arrow">{{ sortArrow('turnover_rate') }}</span></th>
           <th class="sortable" @click="toggleSort('turnover_amount')">成交额(万) <span class="arrow">{{ sortArrow('turnover_amount') }}</span></th>
@@ -56,6 +57,7 @@
           <td class="num">{{ fmt(b.pb_ratio) }}</td>
           <td class="num">{{ b.remaining_years.toFixed(2) }}年</td>
           <td>{{ fmtDate(b.maturity_date) }}</td>
+          <td class="num">{{ fmt(b.maturity_redeem_price) }}</td>
           <td class="num">{{ fmt(b.remaining_size) }}亿</td>
           <td class="num">{{ fmtPct(b.turnover_rate) }}</td>
           <td class="num">{{ fmt(b.turnover_amount) }}</td>

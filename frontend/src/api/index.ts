@@ -31,6 +31,7 @@ export interface BondVO {
   risk_flag?: string
   pure_bond_value: number
   put_value: number
+  maturity_redeem_price: number
   elasticity: number
   pb_ratio: number
   redeem_trigger_price: number
